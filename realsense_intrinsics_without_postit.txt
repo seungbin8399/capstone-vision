@@ -1,0 +1,13 @@
+experiment_name=without_postit
+stream=color_aligned_depth
+width=640
+height=480
+fx=604.475219727
+fy=603.970153809
+cx=332.252532959
+cy=244.043548584
+formula_x=(center_u-cx)*z/fx
+formula_y=(center_v-cy)*z/fy
+formula_z=filtered_depth_m
+model=distortion.inverse_brown_conrady
+coeffs=0.000000000,0.000000000,0.000000000,0.000000000,0.000000000
