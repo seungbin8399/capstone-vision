@@ -25,3 +25,12 @@ Thumbs.db
 # Local environment files
 .env
 .env.*
+
+# Generated experiment outputs
+outputs/
+
+# Local model weights and datasets
+*.pt
+*.onnx
+*.engine
+datasets/
