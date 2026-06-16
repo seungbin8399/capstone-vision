@@ -1,5 +1,7 @@
 import argparse
+from dataclasses import replace
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -168,6 +170,36 @@ def parse_args():
         default="camera_color_optical_frame",
         help="frame_id for camera-frame PoseStamped/PointStamped messages.",
     )
+    parser.add_argument(
+        "--depth-sample-radius",
+        type=int,
+        default=3,
+        help="Pixel radius for median depth sampling around block/slot centers.",
+    )
+    parser.add_argument(
+        "--min-valid-depth-samples",
+        type=int,
+        default=3,
+        help="Minimum nonzero depth samples required for camera XYZ.",
+    )
+    parser.add_argument(
+        "--link0-frame",
+        default="link0",
+        help="Robot base frame_id used when publishing transformed robot poses.",
+    )
+    parser.add_argument(
+        "--link0-from-camera-xyz",
+        help=(
+            "Optional static transform translation tx,ty,tz in meters. "
+            "When provided, camera XYZ is transformed and published as /vision/block_pose "
+            "and /vision/target_slot_pose in --link0-frame."
+        ),
+    )
+    parser.add_argument(
+        "--link0-from-camera-rpy",
+        default="0,0,0",
+        help="Optional static transform rotation roll,pitch,yaw in radians. Default: 0,0,0.",
+    )
     return parser.parse_args()
 
 
@@ -201,10 +233,108 @@ def timestamp() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
 
+def parse_float_triplet(text: str, name: str) -> tuple[float, float, float]:
+    parts = [part.strip() for part in text.split(",")]
+    if len(parts) != 3:
+        raise ValueError(f"{name} must have exactly three comma-separated values: {text}")
+    try:
+        return tuple(float(part) for part in parts)
+    except ValueError as exc:
+        raise ValueError(f"{name} must contain only numbers: {text}") from exc
+
+
+def rpy_to_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return np.array(
+        [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ],
+        dtype=np.float64,
+    )
+
+
+def link0_transform_from_args(args):
+    if not args.link0_from_camera_xyz:
+        return None
+
+    translation = np.array(
+        parse_float_triplet(args.link0_from_camera_xyz, "--link0-from-camera-xyz"),
+        dtype=np.float64,
+    )
+    roll, pitch, yaw = parse_float_triplet(
+        args.link0_from_camera_rpy,
+        "--link0-from-camera-rpy",
+    )
+    rotation = rpy_to_matrix(roll, pitch, yaw)
+    return rotation, translation
+
+
+def transform_camera_xyz_to_link0(xyz, transform) -> list[float]:
+    rotation, translation = transform
+    point = np.array(xyz, dtype=np.float64)
+    transformed = rotation @ point + translation
+    return [float(value) for value in transformed.tolist()]
+
+
+def sample_depth_m(depth_frame, center: tuple[int, int], radius: int, min_samples: int) -> float | None:
+    if depth_frame is None:
+        return None
+
+    center_u, center_v = center
+    width = depth_frame.get_width()
+    height = depth_frame.get_height()
+    radius = max(0, int(radius))
+    samples = []
+
+    for v in range(max(0, center_v - radius), min(height, center_v + radius + 1)):
+        for u in range(max(0, center_u - radius), min(width, center_u + radius + 1)):
+            depth = float(depth_frame.get_distance(u, v))
+            if depth > 0.0 and np.isfinite(depth):
+                samples.append(depth)
+
+    if len(samples) < min_samples:
+        return None
+    return float(np.median(np.array(samples, dtype=np.float32)))
+
+
+def deproject_center_to_camera_xyz(
+    center: tuple[int, int],
+    depth_frame,
+    intrinsics,
+    rs_module,
+    radius: int,
+    min_samples: int,
+) -> tuple[float | None, tuple[float, float, float] | None]:
+    if depth_frame is None or intrinsics is None or rs_module is None:
+        return None, None
+
+    depth_m = sample_depth_m(depth_frame, center, radius, min_samples)
+    if depth_m is None:
+        return None, None
+
+    xyz = rs_module.rs2_deproject_pixel_to_point(
+        intrinsics,
+        [int(center[0]), int(center[1])],
+        depth_m,
+    )
+    return depth_m, (float(xyz[0]), float(xyz[1]), float(xyz[2]))
+
+
 class VisionRosPublisher:
     """Optional ROS2 publisher loaded only when --ros-publish is enabled."""
 
-    def __init__(self, node_name: str, camera_frame: str, publish_rate_hz: float):
+    def __init__(
+        self,
+        node_name: str,
+        camera_frame: str,
+        publish_rate_hz: float,
+        link0_frame: str,
+        publish_link0_poses: bool,
+    ):
         try:
             import rclpy
             from geometry_msgs.msg import PointStamped, PoseStamped
@@ -220,6 +350,8 @@ class VisionRosPublisher:
         self.PoseStamped = PoseStamped
         self.String = String
         self.camera_frame = camera_frame
+        self.link0_frame = link0_frame
+        self.publish_link0_poses = publish_link0_poses
         self.min_period_sec = 0.0 if publish_rate_hz <= 0 else 1.0 / publish_rate_hz
         self.last_publish_time = 0.0
 
@@ -247,6 +379,19 @@ class VisionRosPublisher:
             "/vision/target_slot_pose_camera",
             10,
         )
+        self.block_pose_link0_pub = None
+        self.target_pose_link0_pub = None
+        if self.publish_link0_poses:
+            self.block_pose_link0_pub = self.node.create_publisher(
+                self.PoseStamped,
+                "/vision/block_pose",
+                10,
+            )
+            self.target_pose_link0_pub = self.node.create_publisher(
+                self.PoseStamped,
+                "/vision/target_slot_pose",
+                10,
+            )
 
         domain_id = os.environ.get("ROS_DOMAIN_ID", "not set")
         print(f"ROS2 publish enabled. node={node_name}, frame_id={camera_frame}, ROS_DOMAIN_ID={domain_id}")
@@ -254,7 +399,10 @@ class VisionRosPublisher:
         print("  /vision/slot_grid_result       std_msgs/String")
         print("  /vision/block_pose_camera      geometry_msgs/PoseStamped")
         print("  /vision/target_slot_pixel      geometry_msgs/PointStamped")
-        print("  /vision/target_slot_pose_camera geometry_msgs/PoseStamped (future target depth)")
+        print("  /vision/target_slot_pose_camera geometry_msgs/PoseStamped")
+        if self.publish_link0_poses:
+            print(f"  /vision/block_pose             geometry_msgs/PoseStamped ({link0_frame})")
+            print(f"  /vision/target_slot_pose       geometry_msgs/PoseStamped ({link0_frame})")
 
     def publish(self, result: dict) -> None:
         now_sec = time.time()
@@ -279,6 +427,15 @@ class VisionRosPublisher:
         target_pose_msg = self._make_target_slot_pose(result, stamp)
         if target_pose_msg is not None:
             self.target_pose_pub.publish(target_pose_msg)
+
+        if self.publish_link0_poses:
+            block_link0_msg = self._make_first_block_link0_pose(result, stamp)
+            if block_link0_msg is not None:
+                self.block_pose_link0_pub.publish(block_link0_msg)
+
+            target_link0_msg = self._make_target_slot_link0_pose(result, stamp)
+            if target_link0_msg is not None:
+                self.target_pose_link0_pub.publish(target_link0_msg)
 
         self.last_publish_time = now_sec
         self.rclpy.spin_once(self.node, timeout_sec=0.0)
@@ -328,6 +485,43 @@ class VisionRosPublisher:
         msg = self.PoseStamped()
         msg.header.stamp = stamp
         msg.header.frame_id = self.camera_frame
+        msg.pose.position.x = float(xyz[0])
+        msg.pose.position.y = float(xyz[1])
+        msg.pose.position.z = float(xyz[2])
+        msg.pose.orientation.x = 0.0
+        msg.pose.orientation.y = 0.0
+        msg.pose.orientation.z = 0.0
+        msg.pose.orientation.w = 1.0
+        return msg
+
+    def _make_first_block_link0_pose(self, result: dict, stamp):
+        for block in result.get("blocks", []):
+            xyz = block.get("link0_xyz_m")
+            if xyz is None:
+                continue
+
+            msg = self.PoseStamped()
+            msg.header.stamp = stamp
+            msg.header.frame_id = self.link0_frame
+            msg.pose.position.x = float(xyz[0])
+            msg.pose.position.y = float(xyz[1])
+            msg.pose.position.z = float(xyz[2])
+            msg.pose.orientation.x = 0.0
+            msg.pose.orientation.y = 0.0
+            msg.pose.orientation.z = 0.0
+            msg.pose.orientation.w = 1.0
+            return msg
+        return None
+
+    def _make_target_slot_link0_pose(self, result: dict, stamp):
+        placeholder = result.get("robot_target_placeholder", {})
+        xyz = placeholder.get("target_slot_base_xyz_m")
+        if xyz is None:
+            return None
+
+        msg = self.PoseStamped()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.link0_frame
         msg.pose.position.x = float(xyz[0])
         msg.pose.position.y = float(xyz[1])
         msg.pose.position.z = float(xyz[2])
@@ -580,7 +774,22 @@ def print_block_summary(block_detections: list[BlockDetection]) -> None:
 
 def print_slot_summary(result: dict) -> None:
     target = result["target_slot"]
-    target_text = "none" if target is None else f"{target['slot_id']} center={target['center']}"
+    if target is None:
+        target_text = "none"
+    else:
+        target_text = f"{target['slot_id']} center={target['center']}"
+        camera_xyz = target.get("camera_xyz_m")
+        link0_xyz = target.get("link0_xyz_m")
+        if camera_xyz is not None:
+            target_text += (
+                f" camera_xyz=({camera_xyz[0]:.3f},"
+                f"{camera_xyz[1]:.3f},{camera_xyz[2]:.3f})m"
+            )
+        if link0_xyz is not None:
+            target_text += (
+                f" link0_xyz=({link0_xyz[0]:.3f},"
+                f"{link0_xyz[1]:.3f},{link0_xyz[2]:.3f})m"
+            )
     slots = result["slots"]
     if len(slots) > 36:
         occupied = [slot for slot in slots if slot["status"] == "occupied"]
@@ -672,6 +881,99 @@ def filter_block_detections(args, image_shape, block_detections: list[BlockDetec
     return filtered
 
 
+def add_depth_to_block_detections(
+    args,
+    block_detections: list[BlockDetection],
+    depth_frame=None,
+    intrinsics=None,
+    rs_module=None,
+) -> list[BlockDetection]:
+    if depth_frame is None or intrinsics is None or rs_module is None:
+        return block_detections
+
+    enriched = []
+    for detection in block_detections:
+        if detection.camera_xyz_m is not None:
+            enriched.append(detection)
+            continue
+
+        depth_m, camera_xyz_m = deproject_center_to_camera_xyz(
+            center=detection.center,
+            depth_frame=depth_frame,
+            intrinsics=intrinsics,
+            rs_module=rs_module,
+            radius=args.depth_sample_radius,
+            min_samples=args.min_valid_depth_samples,
+        )
+        if camera_xyz_m is None:
+            enriched.append(detection)
+            continue
+
+        enriched.append(
+            replace(
+                detection,
+                depth_m=depth_m,
+                camera_xyz_m=camera_xyz_m,
+            )
+        )
+    return enriched
+
+
+def add_target_slot_camera_xyz(
+    args,
+    result: dict | None,
+    depth_frame=None,
+    intrinsics=None,
+    rs_module=None,
+) -> None:
+    if result is None:
+        return
+
+    target = result.get("target_slot")
+    if target is None:
+        return
+
+    center = target.get("center")
+    if center is None:
+        return
+
+    depth_m, camera_xyz_m = deproject_center_to_camera_xyz(
+        center=(int(center[0]), int(center[1])),
+        depth_frame=depth_frame,
+        intrinsics=intrinsics,
+        rs_module=rs_module,
+        radius=args.depth_sample_radius,
+        min_samples=args.min_valid_depth_samples,
+    )
+    if camera_xyz_m is None:
+        return
+
+    target["depth_m"] = depth_m
+    target["camera_xyz_m"] = list(camera_xyz_m)
+    placeholder = result.setdefault("robot_target_placeholder", {})
+    placeholder["target_slot_camera_xyz_m"] = list(camera_xyz_m)
+
+
+def add_link0_xyz_to_result(result: dict | None, transform, link0_frame: str) -> None:
+    if result is None or transform is None:
+        return
+
+    for block in result.get("blocks", []):
+        xyz = block.get("camera_xyz_m")
+        if xyz is not None:
+            block["link0_xyz_m"] = transform_camera_xyz_to_link0(xyz, transform)
+
+    target = result.get("target_slot")
+    placeholder = result.setdefault("robot_target_placeholder", {})
+    target_camera_xyz = placeholder.get("target_slot_camera_xyz_m")
+    if target_camera_xyz is not None:
+        target_link0_xyz = transform_camera_xyz_to_link0(target_camera_xyz, transform)
+        placeholder["target_slot_base_xyz_m"] = target_link0_xyz
+        placeholder["frame_id"] = link0_frame
+        if target is not None:
+            target["link0_xyz_m"] = target_link0_xyz
+
+
 def process_one_frame(
     image,
     args,
@@ -697,6 +999,13 @@ def process_one_frame(
     if args.image:
         block_detections = add_image_fallback_blocks(args, image, block_detections)
     block_detections = filter_block_detections(args, image.shape, block_detections)
+    block_detections = add_depth_to_block_detections(
+        args=args,
+        block_detections=block_detections,
+        depth_frame=depth_frame,
+        intrinsics=intrinsics,
+        rs_module=rs_module,
+    )
 
     if not args.enable_slot_grid:
         return None, annotated, block_detections
@@ -714,6 +1023,14 @@ def process_one_frame(
         occupancy_mode=args.occupancy_mode,
         min_slot_overlap=args.min_slot_overlap,
     )
+    add_target_slot_camera_xyz(
+        args=args,
+        result=result,
+        depth_frame=depth_frame,
+        intrinsics=intrinsics,
+        rs_module=rs_module,
+    )
+    add_link0_xyz_to_result(result, link0_transform_from_args(args), args.link0_frame)
     return result, debug_image, block_detections
 
 
@@ -908,6 +1225,8 @@ def main():
                 node_name=args.ros_node_name,
                 camera_frame=args.camera_frame,
                 publish_rate_hz=args.ros_rate,
+                link0_frame=args.link0_frame,
+                publish_link0_poses=args.link0_from_camera_xyz is not None,
             )
 
         if args.camera:
