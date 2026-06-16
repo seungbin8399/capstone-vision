@@ -31,6 +31,7 @@ outputs/
 
 # Local model weights and datasets
 *.pt
+!best.pt
 *.onnx
 *.engine
 datasets/
